@@ -1,0 +1,9 @@
+# Node dependencies and build output
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# Local environment overrides
+.env*.local
