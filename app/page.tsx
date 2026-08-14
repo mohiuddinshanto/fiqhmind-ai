@@ -3,9 +3,14 @@
 import { useCallback, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { parseSSE, type SSEEvent } from "@/lib/sse";
+import { parseSSE, SSETimeoutError, type SSEEvent } from "@/lib/sse";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api/v1";
+
+// If the backend produces no SSE bytes for this long (e.g. a silently hung
+// provider), the stream is aborted locally and the turn errors out instead of
+// staying stuck in `streaming`. Any data resets the timer.
+const SSE_INACTIVITY_TIMEOUT_MS = 60_000;
 
 const LANGUAGES = [
   { code: "bn", label: "বাংলা" },
@@ -55,6 +60,23 @@ function newId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+/**
+ * Render the live streamed preview as inert text. The backend streams raw LLM
+ * tokens before the final (server-sanitized) answer arrives; those tokens must
+ * never be injected as HTML. DOMParser does not execute scripts or event
+ * handlers, and `textContent` is rendered as plain React text, so a hostile
+ * token stream can only ever display as literal text.
+ */
+function previewText(html: string): string {
+  if (!html) return "";
+  try {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    return doc.body.textContent ?? "";
+  } catch {
+    return html.replace(/<[^>]*>/g, "");
+  }
+}
+
 export default function Home() {
   const [question, setQuestion] = useState("");
   const [language, setLanguage] = useState<Language>("bn");
@@ -98,29 +120,36 @@ export default function Home() {
         throw new Error(message);
       }
 
-      await parseSSE(response, (event: SSEEvent) => {
-        if (event.event === "token") {
-          const text = (event.data as { text?: string })?.text ?? "";
-          setTurns((prev) =>
-            prev.map((turn) =>
-              turn.id === id ? { ...turn, explanation: turn.explanation + text } : turn,
-            ),
-          );
-        } else if (event.event === "done") {
-          const answer = event.data as ChatAnswer;
-          updateTurn(id, {
-            status: "done",
-            // The validated answer is authoritative — replace the live stream.
-            explanation: answer.explanation.html,
-            answer,
-          });
-        } else if (event.event === "error") {
-          const message = (event.data as { message?: string })?.message ?? "The stream failed.";
-          updateTurn(id, { status: "error", error: message });
-        }
-      });
+      await parseSSE(
+        response,
+        (event: SSEEvent) => {
+          if (event.event === "token") {
+            const text = (event.data as { text?: string })?.text ?? "";
+            setTurns((prev) =>
+              prev.map((turn) =>
+                turn.id === id ? { ...turn, explanation: turn.explanation + text } : turn,
+              ),
+            );
+          } else if (event.event === "done") {
+            const answer = event.data as ChatAnswer;
+            updateTurn(id, {
+              status: "done",
+              // The validated answer is authoritative — replace the live stream.
+              explanation: answer.explanation.html,
+              answer,
+            });
+          } else if (event.event === "error") {
+            const message =
+              (event.data as { message?: string })?.message ?? "The stream failed.";
+            updateTurn(id, { status: "error", error: message });
+          }
+        },
+        { inactivityTimeoutMs: SSE_INACTIVITY_TIMEOUT_MS },
+      );
     } catch (err) {
-      if (err instanceof DOMException && err.name === "AbortError") {
+      if (err instanceof SSETimeoutError) {
+        updateTurn(id, { status: "error", error: "The stream timed out. Please try again." });
+      } else if (err instanceof DOMException && err.name === "AbortError") {
         updateTurn(id, { status: "error", error: "Stream aborted." });
       } else {
         const message = err instanceof Error ? err.message : "Network error";
@@ -249,12 +278,16 @@ function TurnCard({ turn }: { turn: Turn }) {
         <p className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-800">{turn.error}</p>
       )}
 
-      {turn.explanation && (
+      {turn.status === "streaming" && turn.explanation ? (
+        <p className="mt-2 text-sm leading-relaxed text-emerald-950">
+          {previewText(turn.explanation)}
+        </p>
+      ) : turn.explanation ? (
         <div
-          className="prose-sm mt-2 space-y-2 text-sm leading-relaxed text-emerald-950 [&_cite]:not-italic [&_cite]:text-emerald-800"
+          className="mt-2 space-y-2 text-sm leading-relaxed text-emerald-950 [&_cite]:not-italic [&_cite]:text-emerald-800"
           dangerouslySetInnerHTML={{ __html: turn.explanation }}
         />
-      )}
+      ) : null}
 
       {refusal && refusal.reason === "insufficient_evidence" && (
         <p className="mt-3 text-xs text-emerald-900/60">
