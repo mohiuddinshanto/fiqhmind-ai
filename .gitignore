@@ -7,3 +7,4 @@ dist/
 
 # Local environment overrides
 .env*.local
+.vercel

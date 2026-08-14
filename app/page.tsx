@@ -2,10 +2,10 @@
 
 import { useCallback, useRef, useState } from "react";
 
+import UploadCard from "@/components/UploadCard";
 import { Button } from "@/components/ui/button";
+import { API_URL } from "@/lib/config";
 import { parseSSE, SSETimeoutError, type SSEEvent } from "@/lib/sse";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api/v1";
 
 // If the backend produces no SSE bytes for this long (e.g. a silently hung
 // provider), the stream is aborted locally and the turn errors out instead of
@@ -54,6 +54,21 @@ interface Turn {
   explanation: string;
   answer?: ChatAnswer;
   error?: string;
+}
+
+/**
+ * Map an HTTP status to a fixed, user-safe message. The backend error body is
+ * intentionally never surfaced: it may carry internal details (provider,
+ * database, filesystem) that must not reach the browser.
+ */
+function httpErrorMessage(status: number): string {
+  if (status === 429) {
+    return "You're sending requests too quickly. Please wait a moment and try again.";
+  }
+  if (status >= 500) {
+    return "The server is having trouble right now. Please try again in a moment.";
+  }
+  return "The request could not be completed. Please try again.";
 }
 
 function newId(): string {
@@ -110,14 +125,9 @@ export default function Home() {
       });
 
       if (!response.ok) {
-        let message = `Request failed (HTTP ${response.status})`;
-        try {
-          const body = await response.json();
-          message = body?.error?.message ?? message;
-        } catch {
-          // non-JSON error body — keep the generic message
-        }
-        throw new Error(message);
+        // Backend reached, but the request failed: 429 rate-limited, 5xx
+        // server/internal-dependency failure, or some other HTTP error.
+        throw new Error(httpErrorMessage(response.status));
       }
 
       await parseSSE(
@@ -139,9 +149,12 @@ export default function Home() {
               answer,
             });
           } else if (event.event === "error") {
-            const message =
-              (event.data as { message?: string })?.message ?? "The stream failed.";
-            updateTurn(id, { status: "error", error: message });
+            // Fixed client-side message: never surface details from the streamed
+            // backend `error` event.
+            updateTurn(id, {
+              status: "error",
+              error: "The answer could not be generated. Please try again.",
+            });
           }
         },
         { inactivityTimeoutMs: SSE_INACTIVITY_TIMEOUT_MS },
@@ -151,6 +164,13 @@ export default function Home() {
         updateTurn(id, { status: "error", error: "The stream timed out. Please try again." });
       } else if (err instanceof DOMException && err.name === "AbortError") {
         updateTurn(id, { status: "error", error: "Stream aborted." });
+      } else if (err instanceof TypeError) {
+        // `fetch` network-level failures (connection refused, DNS, CORS) surface
+        // as `TypeError: Failed to fetch` — show an actionable message instead.
+        updateTurn(id, {
+          status: "error",
+          error: "Could not reach the server. Please try again in a moment.",
+        });
       } else {
         const message = err instanceof Error ? err.message : "Network error";
         updateTurn(id, { status: "error", error: message });
@@ -177,6 +197,8 @@ export default function Home() {
       </header>
 
       <section className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-4 px-6 py-6">
+        <UploadCard />
+
         {turns.length === 0 ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-4 text-center">
             <p className="max-w-xl text-lg leading-relaxed text-emerald-900/80">
